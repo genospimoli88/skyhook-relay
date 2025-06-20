@@ -2,6 +2,11 @@ from flask import Flask, request, jsonify
 import uuid, logging, os, redis, json
 from concurrent.futures import ThreadPoolExecutor
 import utils
+import os
+
+# Ensure necessary directories exist
+for folder in ["uploads", "processed", "status"]:
+    os.makedirs(folder, exist_ok=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
