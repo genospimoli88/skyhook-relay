@@ -1,4 +1,0 @@
-flask==2.3.2
-stripe==9.11.0
-requests==2.31.0
-boto3==1.34.14
