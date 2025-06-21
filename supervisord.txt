@@ -1,0 +1,14 @@
+[supervisord]
+nodaemon=true
+
+[program:uvicorn]
+command=uvicorn main:app --host 0.0.0.0 --port 8000
+stdout_logfile=/mnt/data/jobs/uvicorn.log
+stderr_logfile=/mnt/data/jobs/uvicorn.log
+autorestart=true
+
+[program:worker]
+command=python job_processor.py
+stdout_logfile=/mnt/data/jobs/worker.log
+stderr_logfile=/mnt/data/jobs/worker.log
+autorestart=true
