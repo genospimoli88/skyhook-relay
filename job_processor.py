@@ -6,7 +6,7 @@ from datetime import datetime
 import redis
 import stripe
 import time
-from math import exp  # Added for exp(attempt)
+from math import exp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from hashlib import sha256
@@ -17,10 +17,16 @@ import asyncio
 import multiprocessing
 
 # Setup logging
+LOG_DIR = os.getenv("LOG_DIR", "/mnt/data/jobs")
+LOG_FILE = os.path.join(LOG_DIR, "worker.log")
+os.makedirs(LOG_DIR, exist_ok=True)  # Create directory if it doesn't exist
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.FileHandler("/mnt/data/jobs/worker.log"), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler(LOG_FILE),  # Use the dynamic log file path
+        logging.StreamHandler()         # Always include console logging as fallback
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -122,7 +128,7 @@ def charge_stripe(job_id, amount, batch=False, instant=False):
             currency="usd",
             customer=customer.id,
             description=f"{'Instant ' if instant else 'Batch ' if batch else ''}charge for job {job_id}",
-            metadata={"job_id": job_id}  # Added for dispute tracing
+            metadata={"job_id": job_id}
         )
         logger.info(f"Charged ${amount} for job {job_id}, charge ID: {charge.id}")
         return charge.id
@@ -167,7 +173,7 @@ async def process_job(job_data, max_retries=1):
                 return
             break
         if attempt < max_retries:
-            wait_time = exp(attempt)  # Using math.exp
+            wait_time = exp(attempt)
             logger.info(f"Retrying job {job_id}, attempt {attempt + 1}/{max_retries + 1}, waiting {wait_time:.2f}s")
             await asyncio.sleep(wait_time)
     else:
@@ -189,7 +195,7 @@ async def process_job(job_data, max_retries=1):
         "latency_ms": int(latency)
     })
     r.expire(f"job:{job_id}", JOB_TTL)
-    r.lrem(queue_key, 0, job_id)  # Remove from queue after processing
+    r.lrem(queue_key, 0, job_id)
 
     notify_webhook(webhook_url, {
         "job_id": job_id,
@@ -313,7 +319,7 @@ async def submit_job(job: dict):
 
     job_data = {"job_id": job_id, "job_type": job_type, "input_url": input_url, "webhook_url": webhook_url, "price": price}
     queue_key = f"queue:{'instant' if job_type == 'instant' else 'batch_' + job_type}"
-    r.hset(f"job:{job_id}", mapping=job_data)  # Replaced hmset with hset
+    r.hset(f"job:{job_id}", mapping=job_data)
     r.lpush(queue_key, job_id)
     return {"status": "accepted"}
 
@@ -380,13 +386,13 @@ def run_worker():
         for job_type in ["weather", "text_classification", "summarization"]:
             queued_jobs = [r.hgetall(f"job:{job_id[1]}") for job_id in r.lrange(f"queue:batch_{job_type}", 0, BATCH_SIZE - 1)]
             if queued_jobs and (len(queued_jobs) >= BATCH_SIZE or time.time() % BATCH_TIMEOUT < 1):
-                r.delete(f"queue:batch_{job_type}")  # Direct delete after range
+                r.delete(f"queue:batch_{job_type}")
                 loop.run_until_complete(process_batch(queued_jobs))
         time.sleep(1)
 
 def adjust_workers():
     total_jobs = sum(len(r.lrange(f"queue:{key}", 0, -1)) for key in ["instant"] + [f"batch_{t}" for t in ["weather", "text_classification", "summarization"]])
-    current_workers = multiprocessing.active_children().count
+    current_workers = len(multiprocessing.active_children())
     target_workers = min(MAX_WORKERS, max(MIN_WORKERS, (total_jobs + TARGET_JOBS_PER_WORKER - 1) // TARGET_JOBS_PER_WORKER))
     
     if current_workers < target_workers:
