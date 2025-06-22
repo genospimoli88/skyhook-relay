@@ -1,254 +1,421 @@
-import json
-import time
-import redis
-import requests
 import os
+import json
+import requests
 import logging
-import traceback
-import stripe
 from datetime import datetime
+import redis
+import stripe
+import time
+from math import exp  # Added for exp(attempt)
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from hashlib import sha256
+from hmac import compare_digest
+import aiohttp
+from functools import wraps
+import asyncio
+import multiprocessing
 
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler("/mnt/data/jobs/worker.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("/mnt/data/jobs/worker.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
+# Setup FastAPI
+app = FastAPI()
+
+# Environment vars
 stripe.api_key = os.getenv("STRIPE_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT", "https://skyhook.yourdomain.com")
-try:
-    r = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
-    r.ping()
-    logger.info("Connected to Redis")
-except redis.exceptions.RedisError as e:
-    logger.error(f"Failed to connect to Redis: {e}")
-    exit(1)
+REDIS_URL = os.getenv("REDIS_URL", "redis://your-redis-host:6379")
+CLOUD_STORAGE_URL = os.getenv("CLOUD_STORAGE_URL")  # e.g., R2/S3 endpoint
+PROVIDER_API_KEYS = {
+    "runpod": os.getenv("RUNPOD_API_KEY"),
+    "openrouter": os.getenv("OPENROUTER_API_KEY"),
+    "together": os.getenv("TOGETHER_API_KEY")
+}
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+INSTANT_MIN_FEE = float(os.getenv("INSTANT_MIN_FEE", 0.30))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10))
+BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", 20))
+JOB_TTL = int(os.getenv("JOB_TTL", 86400))  # 24 hours
+REQUESTS_PER_SECOND = float(os.getenv("REQUESTS_PER_SECOND", 10.0))  # Throttle limit
+MIN_WORKERS = int(os.getenv("MIN_WORKERS", 1))  # Autoscaler min
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))  # Autoscaler max
+TARGET_JOBS_PER_WORKER = int(os.getenv("TARGET_JOBS_PER_WORKER", 1000))  # Autoscaler target
+BACKEND_LATENCY = {}
 
-RESULTS_DIR = "/mnt/data/jobs"
-try:
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    logger.info(f"Created results directory: {RESULTS_DIR}")
-except OSError as e:
-    logger.error(f"Failed to create results directory: {e}")
-    exit(1)
+# Redis connection
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
 
-def process_weather_job(job_data):
-    """Process a weather job (mocked)."""
-    job_id = job_data["job_id"]
-    city = job_data.get("city", "Unknown")
+# Throttle decorator
+def throttle(func):
+    last_call = {}
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        provider = kwargs.get('provider')
+        if not provider:
+            return await func(*args, **kwargs)
+        last_call[provider] = last_call.get(provider, 0)
+        min_interval = 1.0 / REQUESTS_PER_SECOND
+        time_since_last = time.time() - last_call[provider]
+        if time_since_last < min_interval:
+            await asyncio.sleep(min_interval - time_since_last)
+        result = await func(*args, **kwargs)
+        last_call[provider] = time.time()
+        return result
+    return wrapper
+
+async def fetch_result_data(result_url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(result_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            response.raise_for_status()
+            return await response.read()
+
+@throttle
+async def dispatch_to_provider(provider, job_id, input_url):
+    api_key = PROVIDER_API_KEYS.get(provider)
+    if not api_key:
+        logger.error(f"No API key for provider {provider}")
+        return None, 0
+    url = f"https://{provider}.com/api/v1/job"
+    payload = {"job_id": job_id, "input_url": input_url}
+    start_time = time.time()
     try:
-        weather_data = {"city": city, "temperature": 20, "condition": "Sunny"}
-        result_data = json.dumps(weather_data).encode()
-        result_path = os.path.join(RESULTS_DIR, f"weather_{job_id}.json")
-        with open(result_path, "wb") as f:
-            f.write(result_data)
-        result_url = f"{RUNPOD_ENDPOINT}/v1/job/result/{job_id}"
-        logger.info(f"Saved weather result for job {job_id} to {result_path}")
-        return {"result_url": result_url, "status": "completed"}
-    except Exception as e:
-        logger.error(f"Failed to process weather job {job_id}: {e}")
-        raise
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=10) as response:
+                if response.status == 429:
+                    retry_after = int(response.headers.get("Retry-After", 1))
+                    logger.warning(f"429 from {provider} for job {job_id}, retrying after {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    return await dispatch_to_provider(provider, job_id, input_url)
+                response.raise_for_status()
+                result_url = (await response.json()).get("result_url")
+                latency = (time.time() - start_time) * 1000
+                BACKEND_LATENCY[provider] = BACKEND_LATENCY.get(provider, 0) * 0.9 + latency * 0.1
+                logger.info(f"Dispatched job {job_id} to {provider}, result URL: {result_url}")
+                return result_url, latency
+    except aiohttp.ClientError as e:
+        logger.error(f"Dispatch failed for job {job_id} to {provider}: {e}")
+        return None, 0
 
-def process_transcription_job(job_data):
-    """Process a transcription job (mocked)."""
-    job_id = job_data["job_id"]
-    audio_url = job_data.get("audio_url")
+def upload_to_cloud(result_data, job_id):
     try:
-        transcription = {"text": "Mocked transcription from audio"}
-        result_data = json.dumps(transcription).encode()
-        result_path = os.path.join(RESULTS_DIR, f"transcription_{job_id}.json")
-        with open(result_path, "wb") as f:
-            f.write(result_data)
-        result_url = f"{RUNPOD_ENDPOINT}/v1/job/result/{job_id}"
-        logger.info(f"Saved transcription result for job {job_id} to {result_path}")
-        return {"result_url": result_url, "status": "completed"}
-    except Exception as e:
-        logger.error(f"Failed to process transcription job {job_id}: {e}")
-        raise
-
-def process_ocr_job(job_data):
-    """Process an OCR job (mocked)."""
-    job_id = job_data["job_id"]
-    image_url = job_data.get("image_url")
-    try:
-        ocr_result = {"text": "Mocked text from image"}
-        result_data = json.dumps(ocr_result).encode()
-        result_path = os.path.join(RESULTS_DIR, f"ocr_{job_id}.json")
-        with open(result_path, "wb") as f:
-            f.write(result_data)
-        result_url = f"{RUNPOD_ENDPOINT}/v1/job/result/{job_id}"
-        logger.info(f"Saved OCR result for job {job_id} to {result_path}")
-        return {"result_url": result_url, "status": "completed"}
-    except Exception as e:
-        logger.error(f"Failed to process OCR job {job_id}: {e}")
-        raise
-
-def process_llm_job(job_data):
-    """Process an LLM job (mocked)."""
-    job_id = job_data["job_id"]
-    prompt = job_data.get("prompt", "Default prompt")
-    try:
-        llm_result = {"response": f"Mocked LLM response to: {prompt}"}
-        result_data = json.dumps(llm_result).encode()
-        result_path = os.path.join(RESULTS_DIR, f"llm_{job_id}.json")
-        with open(result_path, "wb") as f:
-            f.write(result_data)
-        result_url = f"{RUNPOD_ENDPOINT}/v1/job/result/{job_id}"
-        logger.info(f"Saved LLM result for job {job_id} to {result_path}")
-        return {"result_url": result_url, "status": "completed"}
-    except Exception as e:
-        logger.error(f"Failed to process LLM job {job_id}: {e}")
-        raise
-
-def update_job_status(job_id: str, status: str, result_url: str = None):
-    """Update job status and result URL in Redis."""
-    try:
-        updates = {
-            "status": status,
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        if result_url:
-            updates["result_url"] = result_url
-        r.hset(f"job:{job_id}", mapping=updates)
-        logger.info(f"Updated job {job_id} status to {status}")
-    except redis.exceptions.RedisError as e:
-        logger.error(f"Failed to update job status for {job_id}: {e}")
-
-def notify_webhook(webhook_url: str, payload: dict):
-    """Send webhook notification."""
-    try:
-        response = requests.post(webhook_url, json=payload, timeout=10)
+        response = requests.post(CLOUD_STORAGE_URL, data=result_data, timeout=10)
         response.raise_for_status()
-        logger.info(f"Sent webhook to {webhook_url}: {response.status_code}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Webhook failed for {webhook_url}: {e}")
+        upload_url = response.json().get("url")
+        if not upload_url or not requests.head(upload_url).ok:
+            raise ValueError("Invalid or inaccessible upload URL")
+        logger.info(f"Uploaded job {job_id} to {upload_url}")
+        return upload_url
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.error(f"Cloud upload failed for job {job_id}: {e}")
+        return None
 
-def batch_charge_stripe(jobs):
-    """Charge Stripe for a batch of jobs."""
+def charge_stripe(job_id, amount, batch=False, instant=False):
     try:
-        total_amount = sum(float(job.get("price", 0.10)) for job in jobs) * 100
-        payment_tokens = list(set(job.get("payment_token") for job in jobs))
-        if len(payment_tokens) > 1:
-            logger.warning("Multiple payment tokens in batch; using first")
-        customer = stripe.Customer.create(source=payment_tokens[0])
+        customer = stripe.Customer.create(source="tok_visa")
         charge = stripe.Charge.create(
-            amount=int(total_amount),
+            amount=int(amount * 100),
             currency="usd",
             customer=customer.id,
-            description=f"Batch charge for {len(jobs)} jobs"
+            description=f"{'Instant ' if instant else 'Batch ' if batch else ''}charge for job {job_id}",
+            metadata={"job_id": job_id}  # Added for dispute tracing
         )
-        logger.info(f"Batched charge for {len(jobs)} jobs: ${total_amount/100:.2f}, charge ID: {charge.id}")
+        logger.info(f"Charged ${amount} for job {job_id}, charge ID: {charge.id}")
+        return charge.id
     except stripe.error.StripeError as e:
-        logger.error(f"Stripe batch charge failed: {e}")
+        logger.error(f"Stripe charge failed for job {job_id}: {e}")
+        return None
 
-logger.info("Worker started and listening for jobs...")
-
-BATCH_INTERVAL = 5
-while True:
+def refund_stripe(charge_id, amount):
     try:
-        immediate_jobs = []
-        while True:
-            job_id = r.lpop("queue:immediate")
-            if job_id is None:
-                break
-            job_data = r.hgetall(f"job:{job_id}")
-            if job_data:
-                immediate_jobs.append(job_data)
-            else:
-                logger.warning(f"Job data missing for immediate job {job_id}")
-        for job_data in immediate_jobs:
-            job_id = job_data["job_id"]
-            job_type = job_data["job_type"]
-            webhook_url = job_data["webhook_url"]
-            price = float(job_data["price"])
-            logger.info(f"Processing immediate job {job_id}: {job_type}")
-            update_job_status(job_id, "processing")
-            try:
-                if job_type == "weather":
-                    result = process_weather_job(job_data)
-                elif job_type == "transcription":
-                    result = process_transcription_job(job_data)
-                elif job_type == "ocr":
-                    result = process_ocr_job(job_data)
-                elif job_type == "llm":
-                    result = process_llm_job(job_data)
-                else:
-                    logger.error(f"Unknown job type: {job_type}")
-                    update_job_status(job_id, "failed")
-                    continue
-                update_job_status(job_id, result["status"], result.get("result_url"))
-                notify_webhook(webhook_url, {
-                    "job_id": job_id,
-                    "status": result["status"],
-                    "result_url": result.get("result_url"),
-                    "price": price
-                })
-                logger.info(f"Immediate job {job_id} processed successfully")
-            except Exception as e:
-                logger.error(f"Failed to process immediate job {job_id}: {e}")
-                traceback.print_exc()
-                update_job_status(job_id, "failed")
-                notify_webhook(webhook_url, {"job_id": job_id, "status": "failed", "price": price})
+        refund = stripe.Refund.create(charge=charge_id, amount=int(amount * 100))
+        logger.info(f"Refunded ${amount} for charge {charge_id}, refund ID: {refund.id}")
+        return True
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe refund failed for charge {charge_id}: {e}")
+        return False
 
-        start_time = time.time()
-        queued_jobs = []
-        while time.time() - start_time < BATCH_INTERVAL:
-            job_id = r.lpop("queue:queued")
-            if job_id is None:
-                time.sleep(0.1)
-                continue
-            job_data = r.hgetall(f"job:{job_id}")
-            if job_data:
-                queued_jobs.append(job_data)
+async def process_job(job_data, max_retries=1):
+    job_id = job_data["job_id"]
+    webhook_url = job_data["webhook_url"]
+    price = float(job_data.get("price", 0.12))
+    job_type = job_data["job_type"]
+    queue_key = f"queue:{'instant' if job_type == 'instant' else 'batch_' + job_type}"
+
+    charge_id = charge_stripe(job_id, price if job_type != "instant" else INSTANT_MIN_FEE, instant=(job_type == "instant"))
+    if not charge_id:
+        r.hset(f"job:{job_id}", mapping={"status": "failed", "updated_at": datetime.utcnow().isoformat(), "reason": "payment_failed"})
+        notify_webhook(webhook_url, {"job_id": job_id, "status": "failed", "reason": "payment_failed"})
+        return
+
+    start_time = time.time()
+    for attempt in range(max_retries + 1):
+        providers = {"weather": "runpod", "text_classification": "openrouter", "summarization": "together", "instant": "openrouter"}
+        provider = providers.get(job_type)
+        result_url, latency = await dispatch_to_provider(provider, job_id, job_data.get("input_url"))
+        if result_url:
+            result_data = await fetch_result_data(result_url)
+            cloud_url = upload_to_cloud(result_data, job_id)
+            if not cloud_url:
+                refund_stripe(charge_id, price if job_type != "instant" else INSTANT_MIN_FEE)
+                r.hset(f"job:{job_id}", mapping={"status": "failed", "updated_at": datetime.utcnow().isoformat(), "reason": "upload_failed", "refunded": "true"})
+                notify_webhook(webhook_url, {"job_id": job_id, "status": "failed", "reason": "upload_failed", "refunded": "true"})
+                return
+            break
+        if attempt < max_retries:
+            wait_time = exp(attempt)  # Using math.exp
+            logger.info(f"Retrying job {job_id}, attempt {attempt + 1}/{max_retries + 1}, waiting {wait_time:.2f}s")
+            await asyncio.sleep(wait_time)
+    else:
+        refund_stripe(charge_id, price if job_type != "instant" else INSTANT_MIN_FEE)
+        r.hset(f"job:{job_id}", mapping={"status": "failed", "updated_at": datetime.utcnow().isoformat(), "reason": "dispatch_failed", "refunded": "true"})
+        notify_webhook(webhook_url, {"job_id": job_id, "status": "failed", "reason": "dispatch_failed", "refunded": "true"})
+        return
+
+    cost_per_job = 0.08
+    profit_per_job = price - cost_per_job if job_type != "instant" else price - 0.12
+    r.hset(f"job:{job_id}", mapping={
+        "status": "completed",
+        "result_url": cloud_url,
+        "updated_at": datetime.utcnow().isoformat(),
+        "stripe_charge_id": charge_id,
+        "cost_per_job": cost_per_job,
+        "price_per_job": price,
+        "profit_per_job": profit_per_job,
+        "latency_ms": int(latency)
+    })
+    r.expire(f"job:{job_id}", JOB_TTL)
+    r.lrem(queue_key, 0, job_id)  # Remove from queue after processing
+
+    notify_webhook(webhook_url, {
+        "job_id": job_id,
+        "status": "completed",
+        "download_url": cloud_url
+    })
+    logger.info(f"Job {job_id} processed, profit: ${profit_per_job:.2f}, latency: {latency:.2f}ms")
+
+async def process_batch(jobs):
+    if not jobs or len(jobs) < BATCH_SIZE:
+        return
+    total_amount = sum(float(job.get("price", 0.12)) for job in jobs)
+    charge_id = charge_stripe(jobs[0]["job_id"], total_amount, batch=True)
+    if not charge_id:
+        for job in jobs:
+            job_id = job["job_id"]
+            r.hset(f"job:{job_id}", mapping={"status": "failed", "updated_at": datetime.utcnow().isoformat(), "reason": "payment_failed"})
+            logger.error(f"Batch job {job_id} failed: payment_failed")
+        return
+
+    total_cost = 0
+    success_jobs = []
+    start_time = time.time()
+    for job in jobs:
+        job_id = job["job_id"]
+        job_type = job["job_type"]
+        providers = {"weather": "runpod", "text_classification": "openrouter", "summarization": "together"}
+        provider = providers.get(job_type)
+        result_url, latency = await dispatch_to_provider(provider, job_id, job.get("input_url"))
+        if result_url:
+            result_data = await fetch_result_data(result_url)
+            cloud_url = upload_to_cloud(result_data, job_id)
+            if cloud_url:
+                cost_per_job = 0.08
+                price_per_job = float(job.get("price", 0.12))
+                profit_per_job = price_per_job - cost_per_job
+                total_cost += cost_per_job
+                r.hset(f"job:{job_id}", mapping={
+                    "status": "completed",
+                    "result_url": cloud_url,
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "cost_per_job": cost_per_job,
+                    "price_per_job": price_per_job,
+                    "profit_per_job": profit_per_job,
+                    "latency_ms": int(latency)
+                })
+                r.expire(f"job:{job_id}", JOB_TTL)
+                success_jobs.append(job)
             else:
-                logger.warning(f"Job data missing for queued job {job_id}")
-        if queued_jobs:
-            logger.info(f"Processing batch of {len(queued_jobs)} queued jobs")
-            batch_charge_stripe(queued_jobs)
-            for job_data in queued_jobs:
-                job_id = job_data["job_id"]
-                job_type = job_data["job_type"]
-                webhook_url = job_data["webhook_url"]
-                price = float(job_data["price"])
-                logger.info(f"Processing queued job {job_id}: {job_type}")
-                update_job_status(job_id, "processing")
-                try:
-                    if job_type == "weather":
-                        result = process_weather_job(job_data)
-                    elif job_type == "transcription":
-                        result = process_transcription_job(job_data)
-                    elif job_type == "ocr":
-                        result = process_ocr_job(job_data)
-                    elif job_type == "llm":
-                        result = process_llm_job(job_data)
-                    else:
-                        logger.error(f"Unknown job type: {job_type}")
-                        update_job_status(job_id, "failed")
-                        continue
-                    update_job_status(job_id, result["status"], result.get("result_url"))
-                    notify_webhook(webhook_url, {
-                        "job_id": job_id,
-                        "status": result["status"],
-                        "result_url": result.get("result_url"),
-                        "price": price
-                    })
-                    logger.info(f"Queued job {job_id} processed successfully")
-                except Exception as e:
-                    logger.error(f"Failed to process queued job {job_id}: {e}")
-                    traceback.print_exc()
-                    update_job_status(job_id, "failed")
-                    notify_webhook(webhook_url, {"job_id": job_id, "status": "failed", "price": price})
+                r.hset(f"job:{job_id}", mapping={"status": "failed", "updated_at": datetime.utcnow().isoformat(), "reason": "upload_failed"})
+                logger.error(f"Batch job {job_id} failed: upload_failed")
         else:
-            time.sleep(BATCH_INTERVAL - (time.time() - start_time))
-    except redis.exceptions.RedisError as e:
-        logger.error(f"Redis error during job processing: {e}")
-        time.sleep(5)
+            r.hset(f"job:{job_id}", mapping={"status": "failed", "updated_at": datetime.utcnow().isoformat(), "reason": "dispatch_failed"})
+            logger.error(f"Batch job {job_id} failed: dispatch_failed")
+
+    total_profit = total_amount - total_cost
+    if len(success_jobs) < len(jobs):
+        refund_amount = sum(float(job.get("price", 0.12)) for job in jobs if job not in success_jobs)
+        refund_stripe(charge_id, refund_amount)
+        total_profit -= refund_amount
+
+    r.hset("batch:stats", mapping={
+        "total_batch_profit": total_profit,
+        "cost_per_job": total_cost / len(jobs) if jobs else 0,
+        "price_per_job": total_amount / len(jobs) if jobs else 0,
+        "margin_per_job": total_profit / len(jobs) if jobs else 0,
+        "job_count": len(jobs),
+        "success_count": len(success_jobs)
+    })
+    r.expire("batch:stats", JOB_TTL)
+
+    for job in jobs:
+        job_id = job["job_id"]
+        webhook_url = job["webhook_url"]
+        status = r.hget(f"job:{job_id}", "status")
+        result_url = r.hget(f"job:{job_id}", "result_url")
+        notify_webhook(webhook_url, {
+            "job_id": job_id,
+            "status": status,
+            "download_url": result_url if status == "completed" else None,
+            "reason": r.hget(f"job:{job_id}", "reason") if status == "failed" else None
+        })
+    logger.info(f"Processed batch of {len(jobs)} jobs, profit: ${total_profit:.2f}")
+
+def notify_webhook(webhook_url, payload):
+    if not WEBHOOK_SECRET:
+        logger.error("WEBHOOK_SECRET not set, skipping HMAC")
+        return
+    payload_str = json.dumps(payload, sort_keys=True).encode()
+    expected_signature = sha256(WEBHOOK_SECRET.encode() + payload_str).hexdigest()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(webhook_url, json=payload, headers={"X-Webhook-Signature": expected_signature}, timeout=10)
+            response.raise_for_status()
+            signature = response.headers.get("X-Webhook-Signature")
+            if signature and not compare_digest(signature, expected_signature):
+                logger.error(f"Invalid HMAC signature for webhook {payload['job_id']}")
+                return
+            logger.info(f"Webhook notified for {payload['job_id']}: {response.status_code}")
+            return
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Webhook failed for {payload['job_id']}, attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                wait_time = exp(attempt)
+                time.sleep(wait_time)
+
+# Endpoints
+@app.post("/job")
+async def submit_job(job: dict):
+    job_id = job.get("job_id")
+    job_type = job.get("job_type")
+    input_url = job.get("input_url")
+    webhook_url = job.get("webhook_url")
+    price = float(job.get("price", 0.12))
+
+    if not all([job_id, job_type, input_url, webhook_url]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    if job_type not in ["weather", "text_classification", "summarization", "instant"]:
+        raise HTTPException(status_code=400, detail="Invalid job_type")
+
+    job_data = {"job_id": job_id, "job_type": job_type, "input_url": input_url, "webhook_url": webhook_url, "price": price}
+    queue_key = f"queue:{'instant' if job_type == 'instant' else 'batch_' + job_type}"
+    r.hset(f"job:{job_id}", mapping=job_data)  # Replaced hmset with hset
+    r.lpush(queue_key, job_id)
+    return {"status": "accepted"}
+
+@app.get("/job/status/{job_id}")
+async def get_job_status(job_id: str):
+    status = r.hgetall(f"job:{job_id}")
+    if not status:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    return status
+
+@app.post("/job/refund/{job_id}")
+async def refund_job(job_id: str):
+    job_data = r.hgetall(f"job:{job_id}")
+    if not job_data or "stripe_charge_id" not in job_data:
+        return JSONResponse({"error": "Job not found or no charge"}, status_code=404)
+    charge_id = job_data["stripe_charge_id"]
+    amount = float(job_data.get("price_per_job", 0.12))
+    if refund_stripe(charge_id, amount):
+        r.hset(f"job:{job_id}", mapping={"status": "refunded", "updated_at": datetime.utcnow().isoformat()})
+        return {"status": "refunded"}
+    return JSONResponse({"error": "Refund failed"}, status_code=400)
+
+@app.get("/healthz")
+async def health_check():
+    try:
+        r.ping()
+        return {"status": "healthy"}
+    except redis.RedisError:
+        return JSONResponse({"status": "unhealthy"}, status_code=503)
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("Stripe-Signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET"))
+        if event["type"] == "charge.dispute.created":
+            job_id = event["data"]["object"]["metadata"].get("job_id")
+            if job_id and r.exists(f"job:{job_id}"):
+                charge_id = r.hget(f"job:{job_id}", "stripe_charge_id")
+                amount = float(r.hget(f"job:{job_id}", "price_per_job", 0.12))
+                refund_stripe(charge_id, amount)
+                r.hset(f"job:{job_id}", mapping={"status": "disputed_refunded", "updated_at": datetime.utcnow().isoformat()})
+        return {"status": "processed"}
+    except stripe.error.SignatureVerificationError:
+        logger.error("Invalid Stripe signature")
+        raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
-        logger.error(f"Unexpected error during job processing: {e}")
-        traceback.print_exc()
-        time.sleep(5)
+        logger.error(f"Stripe webhook error: {e}")
+        raise HTTPException(status_code=400, detail="Webhook processing failed")
+
+def run_worker():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        # Check instant queue
+        job_id = r.blpop("queue:instant", 1)
+        if job_id:
+            job_data = r.hgetall(f"job:{job_id[1]}")
+            if job_data:
+                loop.run_until_complete(process_job(job_data))
+
+        # Check batch queues
+        for job_type in ["weather", "text_classification", "summarization"]:
+            queued_jobs = [r.hgetall(f"job:{job_id[1]}") for job_id in r.lrange(f"queue:batch_{job_type}", 0, BATCH_SIZE - 1)]
+            if queued_jobs and (len(queued_jobs) >= BATCH_SIZE or time.time() % BATCH_TIMEOUT < 1):
+                r.delete(f"queue:batch_{job_type}")  # Direct delete after range
+                loop.run_until_complete(process_batch(queued_jobs))
+        time.sleep(1)
+
+def adjust_workers():
+    total_jobs = sum(len(r.lrange(f"queue:{key}", 0, -1)) for key in ["instant"] + [f"batch_{t}" for t in ["weather", "text_classification", "summarization"]])
+    current_workers = multiprocessing.active_children().count
+    target_workers = min(MAX_WORKERS, max(MIN_WORKERS, (total_jobs + TARGET_JOBS_PER_WORKER - 1) // TARGET_JOBS_PER_WORKER))
+    
+    if current_workers < target_workers:
+        for _ in range(target_workers - current_workers):
+            p = multiprocessing.Process(target=run_worker)
+            p.start()
+            logger.info(f"Started new worker, total workers: {target_workers}")
+    elif current_workers > target_workers:
+        for _ in range(current_workers - target_workers):
+            if multiprocessing.active_children():
+                multiprocessing.active_children()[-1].terminate()
+            logger.info(f"Stopped worker, total workers: {target_workers}")
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Worker started and listening for jobs...")
+    # Start initial workers
+    for _ in range(MIN_WORKERS):
+        p = multiprocessing.Process(target=run_worker)
+        p.start()
+    
+    # Autoscaler loop
+    def autoscaler():
+        while True:
+            adjust_workers()
+            time.sleep(60)  # Check every minute
+
+    autoscaler_process = multiprocessing.Process(target=autoscaler)
+    autoscaler_process.start()
+    
+    # Run FastAPI
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
