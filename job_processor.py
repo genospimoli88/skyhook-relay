@@ -7,7 +7,7 @@ import redis
 import stripe
 import time
 from math import exp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request  # Added Request import
 from fastapi.responses import JSONResponse
 from hashlib import sha256
 from hmac import compare_digest
@@ -351,7 +351,7 @@ async def health_check():
         return JSONResponse({"status": "unhealthy"}, status_code=503)
 
 @app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
+async def stripe_webhook(request: Request):  # Now correctly typed with imported Request
     payload = await request.body()
     sig_header = request.headers.get("Stripe-Signature")
     try:
