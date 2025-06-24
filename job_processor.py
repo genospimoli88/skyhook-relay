@@ -226,15 +226,19 @@ async def process_job(job_data, max_retries=1):
         r.incr(JOB_FAILURE_PATTERN.format(reason="daily_spend_cap_exceeded"))
         return
 
-    # Input validation (basic hash check)
+  # Input validation (basic hash check)
+input_url = job_data.get("input_url")
+if input_url:
     async with aiohttp.ClientSession() as session:
-        async with session.head(job_data["input_url"], timeout=10) as response:
+        async with session.head(input_url, timeout=10) as response:
             content_hash = response.headers.get("ETag", "")
             if r.exists(f"input_hash:{content_hash}"):
                 r.hset(f"job:{job_id}", mapping={"status": "rejected", "updated_at": datetime.utcnow().isoformat(), "reason": "duplicate_input"})
                 notify_webhook(webhook_url, {"job_id": job_id, "status": "rejected", "reason": "duplicate_input"})
                 r.incr(JOB_FAILURE_PATTERN.format(reason="duplicate_input"))
                 return
+else:
+    content_hash = f"nohash-{job_id}"
 
     # Profit margin check
     provider = {"weather": "openrouter", "text_classification": "openrouter", "summarization": "together", "instant": "openrouter"}[job_type]
