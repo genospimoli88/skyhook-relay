@@ -1,6 +1,0 @@
-redis
-stripe
-requests
-fastapi
-uvicorn
-aiohttp
