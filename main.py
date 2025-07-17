@@ -11,6 +11,11 @@ import redis
 import uvicorn
 
 # -------------------------------
+# Stripe Payments Integration
+# -------------------------------
+from payments import verify_payment_intent
+
+# -------------------------------
 # Configuration
 # -------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -53,6 +58,7 @@ class JobSubmission(BaseModel):
     input_url: HttpUrl
     webhook_url: HttpUrl
     price: float = Field(..., gt=0)
+    payment_intent_id: str = Field(..., description="Stripe PaymentIntent ID")
 
 class RefundRequest(BaseModel):
     job_id: str
@@ -76,9 +82,18 @@ app = FastAPI(title="Skyhook Relay API", version="1.0.0")
 def submit_job(job: JobSubmission):
     job_id = job.job_id.strip() if job.job_id else str(uuid.uuid4())
 
+    # Enforce unique job ID
     if redis_client.exists(f"job:{job_id}"):
         logger.warning(f"Duplicate job_id {job_id}")
         raise HTTPException(status_code=409, detail="job_id already exists")
+
+    # Stripe PaymentIntent check (mandatory!)
+    if not verify_payment_intent(job.payment_intent_id):
+        logger.error(f"Payment for job {job_id} not completed: {job.payment_intent_id}")
+        raise HTTPException(
+            status_code=402, 
+            detail="Payment not confirmed. Please complete payment before submitting the job."
+        )
 
     job_data = {
         "job_id": job_id,
@@ -87,12 +102,11 @@ def submit_job(job: JobSubmission):
         "webhook_url": str(job.webhook_url),
         "price": str(job.price),
         "status": "submitted",
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat(),
+        "payment_intent_id": job.payment_intent_id
     }
 
     redis_client.hset(f"job:{job_id}", mapping=job_data)
-
-    # Queue logic: ensure worker supports batch queues
     queue_name = "queue:instant" if job.job_type == "instant" else f"queue:batch_{job.job_type}"
     redis_client.rpush(queue_name, job_id)
 
@@ -153,3 +167,4 @@ def healthz():
 if __name__ == "__main__":
     logger.info(f"Starting FastAPI on port {PORT}")
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
+
