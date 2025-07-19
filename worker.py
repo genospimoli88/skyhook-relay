@@ -6,17 +6,13 @@ import requests
 from datetime import datetime
 import redis
 
-# Optional: install HuggingFace/transformers/openai if you want to call real APIs
-
-# ---------------------
 # Config
-# ---------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "1"))
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")  # Required for weather jobs
-HF_API_KEY = os.getenv("HF_API_KEY", "")  # For HuggingFace Inference API
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # For OpenAI
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+HF_API_KEY = os.getenv("HF_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -25,10 +21,6 @@ logging.basicConfig(
 logger = logging.getLogger("skyhook-worker")
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-# ---------------------
-# Helper Functions
-# ---------------------
 
 def send_webhook(webhook_url, payload):
     try:
@@ -49,24 +41,17 @@ def fetch_text_from_url(url):
         logger.error(f"❌ Could not fetch text from {url}: {e}")
         return None
 
-# ---------------------
-# Job Type Handlers
-# ---------------------
-
 def handle_weather(job_id, job_data):
-    """Process weather job using OpenWeather API."""
     location = job_data.get("input_url", "")
     webhook_url = job_data.get("webhook_url")
     payload = {"job_id": job_id, "status": "completed"}
 
-    # Support both lat/lon or city name in input_url
     try:
         if "lat=" in location and "lon=" in location:
             lat = location.split("lat=")[1].split("&")[0]
             lon = location.split("lon=")[1].split("&")[0]
             api_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=imperial"
         else:
-            # Fallback: treat as city name
             api_url = f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={OPENWEATHER_API_KEY}&units=imperial"
 
         resp = requests.get(api_url, timeout=10)
@@ -93,7 +78,6 @@ def handle_weather(job_id, job_data):
     })
 
 def handle_text_classification(job_id, job_data):
-    """Process text classification using Hugging Face Inference API (or stub)."""
     webhook_url = job_data.get("webhook_url")
     input_url = job_data.get("input_url")
     text = fetch_text_from_url(input_url) if input_url.startswith("http") else input_url
@@ -122,7 +106,6 @@ def handle_text_classification(job_id, job_data):
     })
 
 def handle_summarization(job_id, job_data):
-    """Process summarization using OpenAI GPT-3.5/4 or HuggingFace."""
     webhook_url = job_data.get("webhook_url")
     input_url = job_data.get("input_url")
     text = fetch_text_from_url(input_url) if input_url.startswith("http") else input_url
@@ -131,7 +114,6 @@ def handle_summarization(job_id, job_data):
     try:
         if not text:
             raise Exception("No text to summarize.")
-        # Example: OpenAI
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
         api_url = "https://api.openai.com/v1/chat/completions"
         prompt = f"Summarize this:\n{text[:2000]}"
@@ -161,7 +143,6 @@ def handle_summarization(job_id, job_data):
     })
 
 def handle_instant(job_id, job_data):
-    """Instant jobs: dispatch by real type field."""
     job_type = job_data.get("job_type")
     logger.info(f"🚀 Handling instant job: {job_id} ({job_type})")
     if job_type == "weather":
@@ -171,7 +152,6 @@ def handle_instant(job_id, job_data):
     elif job_type == "summarization":
         handle_summarization(job_id, job_data)
     else:
-        # Unknown instant job type
         payload = {
             "job_id": job_id,
             "status": "error",
@@ -183,10 +163,6 @@ def handle_instant(job_id, job_data):
             "updated_at": datetime.utcnow().isoformat(),
             "error": payload["error"]
         })
-
-# ---------------------
-# Unified Worker Loop
-# ---------------------
 
 def worker_loop():
     logger.info("🔁 Skyhook worker started")
@@ -209,7 +185,7 @@ def worker_loop():
                 logger.info(f"🛠️ Processing job {job_id} from {queue_name} ({job_data.get('job_type')})")
                 handler(job_id, job_data)
                 job_found = True
-                break  # Only process one job per poll; gives priority to instant jobs
+                break
         if not job_found:
             time.sleep(POLL_INTERVAL)
 
