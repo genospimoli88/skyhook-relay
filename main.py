@@ -5,19 +5,14 @@ from enum import Enum
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 import redis
 import uvicorn
 
-# -------------------------------
-# Stripe Payments Integration
-# -------------------------------
+# Stripe payments import
 from payments import verify_payment_intent
 
-# -------------------------------
-# Configuration
-# -------------------------------
+# Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.expanduser("~"), "skyhook_logs"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -32,9 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------------------
-# Redis connection (fatal if fails)
-# -------------------------------
+# Redis connection
 try:
     redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
     redis_client.ping()
@@ -43,9 +36,7 @@ except Exception as e:
     logger.error(f"❌ Redis connection failed: {e}")
     raise RuntimeError("Redis connection failed. Shutting down.")
 
-# -------------------------------
 # Enums and Models
-# -------------------------------
 class JobType(str, Enum):
     weather = "weather"
     text_classification = "text_classification"
@@ -73,27 +64,19 @@ class JobStatusResponse(BaseModel):
     download_url: str | None = None
     reason: str | None = None
 
-# -------------------------------
-# FastAPI app setup
-# -------------------------------
+# FastAPI setup
 app = FastAPI(title="Skyhook Relay API", version="1.0.0")
 
 @app.post("/job", response_model=JobResponse, status_code=202)
 def submit_job(job: JobSubmission):
     job_id = job.job_id.strip() if job.job_id else str(uuid.uuid4())
-
-    # Enforce unique job ID
     if redis_client.exists(f"job:{job_id}"):
         logger.warning(f"Duplicate job_id {job_id}")
         raise HTTPException(status_code=409, detail="job_id already exists")
 
-    # Stripe PaymentIntent check (mandatory!)
     if not verify_payment_intent(job.payment_intent_id):
         logger.error(f"Payment for job {job_id} not completed: {job.payment_intent_id}")
-        raise HTTPException(
-            status_code=402, 
-            detail="Payment not confirmed. Please complete payment before submitting the job."
-        )
+        raise HTTPException(status_code=402, detail="Payment not confirmed.")
 
     job_data = {
         "job_id": job_id,
@@ -167,4 +150,3 @@ def healthz():
 if __name__ == "__main__":
     logger.info(f"Starting FastAPI on port {PORT}")
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
-
