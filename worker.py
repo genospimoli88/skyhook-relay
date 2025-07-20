@@ -41,17 +41,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("skyhook-worker")
 
-# --- REDIS CLIENT PARSE ---
-import urllib.parse
-
-parsed_url = urllib.parse.urlparse(REDIS_URL)
+# --- REDIS CLIENT ---
+parsed_url = urlparse(REDIS_URL)
 redis_client = redis.Redis(
     host=parsed_url.hostname,
     port=parsed_url.port,
     password=parsed_url.password,
     decode_responses=True
 )
-
 
 
 def send_webhook(webhook_url, payload):
@@ -220,6 +217,11 @@ def worker_loop():
 if __name__ == "__main__":
     try:
         redis_client.ping()
+        logger.info(f"✅ Connected to Redis at {REDIS_URL}")
+        worker_loop()
+    except Exception as e:
+        logger.error(f"❌ Worker startup failed: {e}")
+
         logger.info(f"✅ Connected to Redis at {REDIS_URL}")
         worker_loop()
     except Exception as e:
