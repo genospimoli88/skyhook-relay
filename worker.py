@@ -45,6 +45,7 @@ logger = logging.getLogger("skyhook-worker")
 
 import urllib.parse
 
+parsed_url = urllib.parse.urlparse(REDIS_URL)
 redis_client = redis.Redis(
     host=parsed_url.hostname,
     port=parsed_url.port,
