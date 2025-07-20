@@ -12,6 +12,10 @@ import uvicorn
 # Stripe payments import
 from payments import verify_payment_intent
 
+import os
+print(">>> REDIS_URL in Python:", os.environ.get("REDIS_URL"))
+
+
 # Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.expanduser("~"), "skyhook_logs"))
