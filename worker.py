@@ -6,10 +6,30 @@ import requests
 from datetime import datetime
 import redis
 
-# Config
+# --- CONFIG ---
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "1"))
+
+JOB_COSTS = {
+    "weather": {"openweather": 0.04},
+    "text_classification": {"openai": 0.10, "huggingface": 0.08},
+    "summarization": {"openai": 0.15}
+}
+
+USER_PRICE = {
+    "weather": 0.20,
+    "text_classification": 0.35,
+    "summarization": 0.45
+}
+
+MIN_MARGIN = 0.10
+BATCH_SIZE = 10
+BATCH_MAX_WAIT = 5      # minutes
+MIN_BATCH_MARGIN = 1.00
+INSTANT_FEE = 0.25
+MIN_INSTANT_MARGIN = 0.10
+
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 HF_API_KEY = os.getenv("HF_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -19,7 +39,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("skyhook-worker")
-
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 def send_webhook(webhook_url, payload):
@@ -45,7 +64,6 @@ def handle_weather(job_id, job_data):
     location = job_data.get("input_url", "")
     webhook_url = job_data.get("webhook_url")
     payload = {"job_id": job_id, "status": "completed"}
-
     try:
         if "lat=" in location and "lon=" in location:
             lat = location.split("lat=")[1].split("&")[0]
@@ -53,7 +71,6 @@ def handle_weather(job_id, job_data):
             api_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=imperial"
         else:
             api_url = f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={OPENWEATHER_API_KEY}&units=imperial"
-
         resp = requests.get(api_url, timeout=10)
         resp.raise_for_status()
         weather = resp.json()
@@ -82,7 +99,6 @@ def handle_text_classification(job_id, job_data):
     input_url = job_data.get("input_url")
     text = fetch_text_from_url(input_url) if input_url.startswith("http") else input_url
     payload = {"job_id": job_id, "status": "completed"}
-
     try:
         if not text:
             raise Exception("No text to classify.")
@@ -110,7 +126,6 @@ def handle_summarization(job_id, job_data):
     input_url = job_data.get("input_url")
     text = fetch_text_from_url(input_url) if input_url.startswith("http") else input_url
     payload = {"job_id": job_id, "status": "completed"}
-
     try:
         if not text:
             raise Exception("No text to summarize.")
