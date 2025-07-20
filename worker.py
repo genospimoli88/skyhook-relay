@@ -4,6 +4,7 @@ import json
 import logging
 import requests
 from datetime import datetime
+from urllib.parse import urlparse
 import redis
 
 # --- CONFIG ---
@@ -39,7 +40,17 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("skyhook-worker")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# --- REDIS CLIENT PARSE ---
+parsed = urlparse(REDIS_URL)
+redis_client = redis.Redis(
+    host=parsed.hostname,
+    port=parsed.port,
+    username=parsed.username,
+    password=parsed.password,
+    ssl=parsed.scheme == "rediss",
+    decode_responses=True
+)
 
 def send_webhook(webhook_url, payload):
     try:
