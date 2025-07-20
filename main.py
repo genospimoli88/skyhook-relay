@@ -15,7 +15,6 @@ from payments import verify_payment_intent
 import os
 print(">>> REDIS_URL in Python:", os.environ.get("REDIS_URL"))
 
-
 # Config
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.expanduser("~"), "skyhook_logs"))
@@ -99,6 +98,12 @@ def submit_job(job: JobSubmission):
 
     logger.info(f"Enqueued job {job_id} to {queue_name}")
     return {"job_id": job_id, "status": "submitted"}
+
+# --------- NEW ALIAS ENDPOINT HERE -----------
+@app.post("/jobs", response_model=JobResponse, status_code=202)
+def submit_job_alias(job: JobSubmission):
+    return submit_job(job)
+# ----------------------------------------------
 
 @app.get("/job/status/{job_id}", response_model=JobStatusResponse)
 def get_status(job_id: str):
