@@ -47,11 +47,10 @@ redis_client = redis.Redis(
     host=parsed_url.hostname,
     port=parsed_url.port,
     password=parsed_url.password,
-    ssl=True,
+    ssl=False,  # <-- TURN OFF SSL (this is the fix)
     decode_responses=True,
     socket_timeout=5,
 )
-
 
 
 def send_webhook(webhook_url, payload):
