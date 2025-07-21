@@ -4,11 +4,10 @@ import json
 import logging
 import requests
 from datetime import datetime
-from urllib.parse import urlparse
 import redis
 
 # --- CONFIG ---
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "1"))
 
@@ -41,14 +40,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("skyhook-worker")
 
-# --- REDIS CLIENT ---
-parsed_url = urlparse(REDIS_URL)
-redis_client = redis.Redis(
-    host=parsed_url.hostname,
-    port=parsed_url.port,
-    password=parsed_url.password,
-    decode_responses=True
-)
+# --- REDIS CLIENT (FIXED) ---
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
 
 
 def send_webhook(webhook_url, payload):
