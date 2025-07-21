@@ -40,18 +40,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("skyhook-worker")
 
-from urllib.parse import urlparse
-
-parsed_url = urlparse(REDIS_URL)
-redis_client = redis.Redis(
-    host=parsed_url.hostname,
-    port=parsed_url.port,
-    password=parsed_url.password,
-    ssl=False,  # <-- TURN OFF SSL (this is the fix)
-    decode_responses=True,
-    socket_timeout=5,
-)
-
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 def send_webhook(webhook_url, payload):
     try:
